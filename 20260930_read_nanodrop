@@ -1,0 +1,21 @@
+## Nanodrop's proprietary files are openable using this tbwk package
+## Here's the format to opening the file contents
+
+
+# %%
+from tbwk import Worksheet
+
+# %%
+
+## Enter the file location and the relevant results print
+worksheet = Worksheet.import_worksheet(r"S:\NANODROP\Josh\2026_09_30_Nucleic Acid.twbk")
+
+def prop(m, key):
+    """Return a value from the NanoDrop's results table, or NaN if missing."""
+    bag = m.get_property_bag()
+    return bag.get_property(key).get_value().get_value() if bag.has_property(key) else float("nan")
+
+print(f"{'Sample':20}{'Time':21}{'ng/µl':>10}{'260/280':>9}{'260/230':>9}")
+for m in worksheet:
+    print(f"{m.title:20}{m.get_time():%Y-%m-%d %H:%M:%S}  "
+          f"{prop(m, 'Nucleic Acid'):>9.1f}{prop(m, '260/280'):>9.2f}{prop(m, '260/230'):>9.2f}")
