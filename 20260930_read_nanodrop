@@ -9,7 +9,7 @@ from tbwk import Worksheet
 ## Return values
 
 ## Enter the file location and the relevant results print
-worksheet = Worksheet.import_worksheet(r"S:\NANODROP\Josh\2026_09_30_Nucleic Acid.twbk")
+worksheet = Worksheet.import_worksheet(r"S:\NANODROP\Josh\2026_09_30_Nucleic Acid.twbk") ## \\fs02\SharedFiles\NANODROP\Josh
 
 def prop(m, key):
     """Return a value from the NanoDrop's results table, or NaN if missing."""
