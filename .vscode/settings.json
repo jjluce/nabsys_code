@@ -1,4 +1,6 @@
 {
     "python-envs.defaultEnvManager": "ms-python.python:conda",
-    "python-envs.defaultPackageManager": "ms-python.python:conda"
+    "python-envs.defaultPackageManager": "ms-python.python:conda",
+    "python.useEnvironmentsExtension": true,
+    "python.defaultInterpreterPath": "C:/Users/luce/AppData/Local/miniconda3/envs/jlenv/python.exe"
 }
