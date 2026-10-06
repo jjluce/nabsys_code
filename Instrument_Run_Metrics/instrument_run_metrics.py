@@ -1,23 +1,29 @@
-"""
-instrument_run_metrics.py
-Python port of instrument_run_metrics.R
+# %% [markdown]
+# # Instrument Run Metrics
+# Python port of instrument_run_metrics.R, laid out as `# %%` cells (VS Code "Run Cell" / Interactive Window,
+# Spyder, or PyCharm scientific mode). Run the cells top to bottom; set your options in the **Run settings** cell.
+#
+# Two report types (same as the R version):
+#   * overnight_run_plots() - single-run version (e.g. 16 h data collection), per-channel data,
+#                             one JPG per run ID found in the chosen folder.
+#   * overlay_run_plots()   - overlay version (e.g. instrument audit, tag titration), system-wide
+#                             means for multiple injections onto the same detector, one JPG per folder.
+#
+# Expected input: one experiment folder containing CSVs (with header rows) whose names contain
+# SystemMetrics, ChannelData and RunData, e.g. ChannelData_<SampleID>.csv.
+#
+# Packages: pandas, numpy, matplotlib, statsmodels (geom_smooth equivalent), gspread (Google Sheets).
+# tkinter (file picker) ships with standard Python on Windows.
 
-Two report types (same as the R version):
-  * overnight_run_plots() - single-run version (e.g. 16 h data collection), per-channel data,
-                            one JPG per run ID found in the chosen folder.
-  * overlay_run_plots()   - overlay version (e.g. instrument audit, tag titration), system-wide
-                            means for multiple injections onto the same detector, one JPG per folder.
+# %% Run settings
+MODE = "overnight"           # "overnight" or "overlay"
+EXPERIMENT_DIR = r"C:\Users\luce\Code\data\TC043_D008-02B63894w16-205B21a"        # e.g. r"\\PROTON\TechDevGroup\...\20250429_tag_titration_human"; None = file picker
+OUT_DIR = None               # None = OUTPUT_BASE below, else the experiment folder
+USE_PROTOCOL_SHEET = False    # overnight only: look up protocol settings in Google Sheets
+                             # (needs %APPDATA%\gspread\credentials.json; skipped with a warning if missing)
+SHOW_INLINE = True           # also display each figure when running in cells
 
-Usage
-  python instrument_run_metrics.py overnight            # opens a file picker; pick any file in the experiment folder
-  python instrument_run_metrics.py overlay --dir "\\\\PROTON\\...\\20250429_tag_titration_human"
-  python instrument_run_metrics.py overnight --out "C:\\some\\output\\folder"
-
-Packages: pandas, numpy, matplotlib, statsmodels (geom_smooth equivalent), gspread (Google Sheets).
-tkinter (file picker) ships with standard Python on Windows.
-"""
-
-import argparse
+# %% Imports
 import os
 import re
 import textwrap
@@ -26,12 +32,14 @@ from datetime import datetime
 import numpy as np
 import pandas as pd
 import matplotlib
+import matplotlib.ticker
 
-matplotlib.use("Agg")  # files are saved, never shown; avoids GUI backend issues
 import matplotlib.pyplot as plt  # noqa: E402
 from matplotlib.lines import Line2D  # noqa: E402
 from matplotlib.patches import Rectangle  # noqa: E402
 
+
+# %% Constants
 # --------------------------------------------------------------------------------------------------
 # Settings
 # --------------------------------------------------------------------------------------------------
@@ -48,7 +56,13 @@ LEVEL_ONE_SENTINEL = 400
 
 JPG_DPI = 300  # ggsave default
 
+# R colour names differ from matplotlib's: R "green" is #00FF00 and R "gray" is #BEBEBE
+# (matplotlib's are the darker #008000 / #808080). Use R's values to match the R figures.
+R_GREEN = "#00FF00"
+R_GRAY = "#BEBEBE"
 
+
+# %% Helpers (stand-ins for tidyverse / ggplot behaviour)
 # --------------------------------------------------------------------------------------------------
 # Small helpers (stand-ins for tidyverse / ggplot behaviour)
 # --------------------------------------------------------------------------------------------------
@@ -203,7 +217,20 @@ def list_files(experiment_dir, pattern):
     return sorted(os.path.join(experiment_dir, f) for f in os.listdir(experiment_dir)
                   if rx.search(f) and os.path.isfile(os.path.join(experiment_dir, f)))
 
+def show_figure(fig):
+    """Display a figure inline when running in cells (VS Code / Jupyter); no-op from a plain terminal."""
+    if not SHOW_INLINE:
+        return
+    try:
+        from IPython import get_ipython
+        from IPython.display import display
+        if get_ipython() is not None:
+            display(fig)
+    except ImportError:
+        pass
 
+
+# %% Run metadata from the sample ID, and Time fields
 # --------------------------------------------------------------------------------------------------
 # Helper: run metadata from the sample ID, and Time fields
 # --------------------------------------------------------------------------------------------------
@@ -260,6 +287,7 @@ def run_metrics_metadata_markup(df):
     return df
 
 
+# %% Protocol settings from Google Sheets
 # --------------------------------------------------------------------------------------------------
 # Helper: protocol settings from Google Sheets
 # --------------------------------------------------------------------------------------------------
@@ -299,19 +327,46 @@ def build_protocol_settings_df():
     return out.astype("object")
 
 
+# %% Shared read-in
 # --------------------------------------------------------------------------------------------------
 # Shared read-in
 # --------------------------------------------------------------------------------------------------
 
+RUN_DATA_COLS = ["SampleID", "ProtocolName", "ReagentLot", "SettingsGroup",
+                 "DetectorLotNumber", "DetectorWaferID", "DetectorDieNumber"]
+
+
+def read_run_data(files):
+    """RunData is small but its last column (ChannelIDs) is a long quoted list that has been seen
+    truncated ("...", no closing quote), which breaks the CSV parser. Only RUN_DATA_COLS are used,
+    so repair an unbalanced quote if needed and keep just those columns."""
+    import io
+    frames = []
+    for f in files:
+        with open(f, encoding="utf-8-sig", newline="") as fh:
+            text = fh.read()
+        if text.count('"') % 2:
+            text = text.rstrip("\r\n") + '"\n'
+            print(f"WARNING: {os.path.basename(f)} has an unclosed quote (truncated ChannelIDs?); repaired.")
+        d = pd.read_csv(io.StringIO(text), dtype=str)
+        d = d[[c for c in RUN_DATA_COLS if c in d.columns]]
+        d["filename"] = os.path.basename(f)
+        frames.append(d)
+    if not frames:
+        return pd.DataFrame(columns=RUN_DATA_COLS + ["filename"])
+    return pd.concat(frames, ignore_index=True, sort=False)
+
+
 def read_experiment(experiment_dir):
     system_metrics = concat_csv_files(list_files(experiment_dir, "SystemMetrics"))
     channel_data = concat_csv_files(list_files(experiment_dir, "ChannelData"))
-    run_data = concat_csv_files(list_files(experiment_dir, "RunData"), dtype=str)
+    run_data = read_run_data(list_files(experiment_dir, "RunData"))
     system_metrics = run_metrics_metadata_markup(system_metrics)
     channel_data = run_metrics_metadata_markup(channel_data)
     return system_metrics, channel_data, run_data
 
 
+# %% Overnight (single-run) report - figure
 # --------------------------------------------------------------------------------------------------
 # Overnight (single-run) version
 # --------------------------------------------------------------------------------------------------
@@ -419,7 +474,7 @@ def _overnight_run_figure(run_id, sys_d, ch_d, run_data, protocol_settings):
         _style_overnight(a, "Run Time (hrs)", ylab)
 
     sys_scatter(ax["TERsys"], "TotalEventRate", "hotpink", "Total Event Rate (system)", 0, 800, 200)
-    sys_scatter(ax["E"], "ActiveChannelCount", "green", "Active Channel Count", 0, 260, 50)
+    sys_scatter(ax["E"], "ActiveChannelCount", R_GREEN, "Active Channel Count", 0, 260, 50)
     # (the R script also builds a Bias Voltage panel `V` that is not used in the layout)
 
     a = ax["Cu"]
@@ -464,7 +519,7 @@ def _overnight_run_figure(run_id, sys_d, ch_d, run_data, protocol_settings):
 
     a = ax["CER"]
     nd = norm_er[within(norm_er["TotalEventRate_norm"], 0, 6) & (norm_er["Time"] <= max_ch)]
-    a.scatter(nd["Time"], nd["TotalEventRate_norm"], color="gray", s=0.8, linewidths=0, rasterized=True)
+    a.scatter(nd["Time"], nd["TotalEventRate_norm"], color=R_GRAY, **PT)
     bins = pd.cut(chv["ChannelID"].astype(float), bins=5)  # cut(ChannelID, breaks=5)
     bin_cols = hue_pal(5)
     d = chv.assign(x_bins=bins)
@@ -475,7 +530,7 @@ def _overnight_run_figure(run_id, sys_d, ch_d, run_data, protocol_settings):
         a.plot(xs, ys, color=bin_cols[i], lw=1)
     set_scale(a, "x", 0, max_ch, seq(0, max_ch, 1))
     set_scale(a, "y", 0, 6, seq(0, 6, 1))
-    a.scatter([0], [6], color="gray", s=6, zorder=3)
+    a.scatter([0], [6], color=R_GRAY, s=6, zorder=3)
     a.text(0.01 * max_sys, 6, "Total event rate / Active channel count", ha="left", va="center", fontsize=8)
     for i, lab in enumerate(["Ch1-51", "52-102", "103-153", "154-204", "205-256"]):
         xp = (0.5 + 0.1 * i) * max_sys
@@ -487,7 +542,7 @@ def _overnight_run_figure(run_id, sys_d, ch_d, run_data, protocol_settings):
     d = ch_d[within(ch_d["ChannelID"], 0, 260)]
     v = is_viable(d["ViableChannel"])
     a.scatter(d["Time"][~v], d["ChannelID"][~v], color="red", **PT)
-    a.scatter(d["Time"][v], d["ChannelID"][v], color="green", **PT)
+    a.scatter(d["Time"][v], d["ChannelID"][v], color=R_GREEN, **PT)
     set_scale(a, "x", 0, max_ch, seq(0, max_ch, 1))
     set_scale(a, "y", 0, 260, seq(0, 260, 50))
     _style_overnight(a, "Run Time (hrs)", "Channel Viability")
@@ -538,14 +593,17 @@ def _overnight_run_figure(run_id, sys_d, ch_d, run_data, protocol_settings):
 
     # ---- run metadata from RunData + protocol settings ----
     rd = run_data.loc[run_data["SampleID"] == run_id,
-                      ["SampleID", "ProtocolName", "ReagentLot", "SettingsGroup"]]
+                      [c for c in RUN_DATA_COLS if c in run_data.columns]]
     if protocol_settings is not None:
         rd = rd.merge(protocol_settings, on=["ProtocolName", "SettingsGroup"], how="left")
     setting_cols = [c for c in ["Target Baseline (mV)", "Target Bias (V)", "Applied Pressure (psi)"]
                     if c in rd.columns and rd[c].notna().any()]  # pivot_longer/drop_na/pivot_wider
     rd = rd.rename(columns={"SampleID": "Sample ID", "ProtocolName": "Protocol",
-                            "SettingsGroup": "Settings", "ReagentLot": "Reagent Lot"})
-    sample_cols = ["Sample ID", "Protocol", "Settings"] + setting_cols + ["Reagent Lot"]
+                            "SettingsGroup": "Settings", "ReagentLot": "Reagent Lot",
+                            "DetectorLotNumber": "Lot", "DetectorWaferID": "Wafer",
+                            "DetectorDieNumber": "Die"})
+    detector_cols = [c for c in ["Lot", "Wafer", "Die"] if c in rd.columns]  # from RunData Detector* columns
+    sample_cols = ["Sample ID", "Protocol", "Settings"] + setting_cols + detector_cols + ["Reagent Lot"]
     rd = rd[sample_cols].reset_index(drop=True)
     if rd.empty:
         rd = pd.DataFrame([{c: (run_id if c == "Sample ID" else None) for c in sample_cols}])
@@ -560,9 +618,17 @@ def _overnight_run_figure(run_id, sys_d, ch_d, run_data, protocol_settings):
     return fig
 
 
+# %% Overnight (single-run) report - driver
 def overnight_run_plots(experiment_dir=None, out_dir=None, use_protocol_sheet=True):
     experiment_dir = experiment_dir or choose_experiment_dir()
-    protocol_settings = build_protocol_settings_df() if use_protocol_sheet else None
+    protocol_settings = None
+    if use_protocol_sheet:
+        try:
+            protocol_settings = build_protocol_settings_df()
+        except Exception as e:  # e.g. no gspread credentials.json on this PC, or no network
+            print(f"WARNING: skipping Google Sheets protocol lookup ({type(e).__name__}: {e}).\n"
+                  "         The table will omit Target Baseline / Target Bias / Applied Pressure. "
+                  "Set USE_PROTOCOL_SHEET = False to silence this.")
     stamp = datetime.now().strftime("_%Y%m%d_%H%M%S")
     base = output_prefix(experiment_dir, out_dir)
 
@@ -587,12 +653,14 @@ def overnight_run_plots(experiment_dir=None, out_dir=None, use_protocol_sheet=Tr
         fig = _overnight_run_figure(run_id, sys_d, ch_d, run_data, protocol_settings)
         path = os.path.join(base, f"{run_id}_overnight_instrument_metrics{stamp}.jpg")
         fig.savefig(path, dpi=JPG_DPI)
+        show_figure(fig)
         plt.close(fig)
         print("Saved", path)
         saved.append(path)
     return saved
 
 
+# %% Overlay report - helpers
 # --------------------------------------------------------------------------------------------------
 # Overlay version
 # --------------------------------------------------------------------------------------------------
@@ -635,6 +703,7 @@ def _facet_lines(subfig, df, x, y, facets, colors, group="Injection", ylabel="",
     subfig.supylabel(ylabel, fontsize=11, x=0.01)
 
 
+# %% Overlay report - driver
 def overlay_run_plots(experiment_dir=None, out_dir=None):
     experiment_dir = experiment_dir or choose_experiment_dir()
     stamp = datetime.now().strftime("_%Y%m%d_%H%M%S")
@@ -706,7 +775,7 @@ def overlay_run_plots(experiment_dir=None, out_dir=None):
         for j, wd in enumerate(cd_facets):
             a = axes[i, j]
             m = (cdb["Injection"] == inj) & (cdb["WaferDie"] == wd)
-            for flag, col in [(False, "red"), (True, "green")]:
+            for flag, col in [(False, "red"), (True, R_GREEN)]:
                 d = cdb[m & (viable == flag)]
                 a.scatter(d["Time_minutes"], d["ChannelID"], color=col, s=0.3, linewidths=0, rasterized=True)
             set_scale(a, "y", 0, 260, seq(0, 260, 50))
@@ -723,7 +792,7 @@ def overlay_run_plots(experiment_dir=None, out_dir=None):
     # ---- collected legends at top ----
     inj_handles = [Line2D([], [], color=colors[i], lw=1.5, label=i) for i in injections]
     via_handles = [Line2D([], [], color=c, marker="o", ls="", label=l)
-                   for c, l in [("red", "FALSE"), ("green", "TRUE")]]
+                   for c, l in [("red", "FALSE"), (R_GREEN, "TRUE")]]
     band.legend(handles=inj_handles, title="Injection", loc="center", bbox_to_anchor=(0.4, 0.5),
                ncol=len(inj_handles), fontsize=12, title_fontsize=12, frameon=False)
     band.legend(handles=via_handles, title="ViableChannel", loc="center", bbox_to_anchor=(0.8, 0.5),
@@ -732,22 +801,19 @@ def overlay_run_plots(experiment_dir=None, out_dir=None):
     save_name = "WaferDie_" + "".join(f"{wd}_" for wd in unique_in_order(sm["WaferDie"]))
     path = os.path.join(base, f"{save_name}overlay_instrument_metrics{stamp}.jpg")
     fig.savefig(path, dpi=JPG_DPI)
+    show_figure(fig)
     plt.close(fig)
     print("Saved", path)
     return path
 
 
-# --------------------------------------------------------------------------------------------------
+# %% Run
+if MODE == "overnight":
+    outputs = overnight_run_plots(EXPERIMENT_DIR, OUT_DIR, use_protocol_sheet=USE_PROTOCOL_SHEET)
+elif MODE == "overlay":
+    outputs = overlay_run_plots(EXPERIMENT_DIR, OUT_DIR)
+else:
+    raise ValueError(f"Unknown MODE: {MODE!r}")
+outputs
 
-if __name__ == "__main__":
-    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("mode", choices=["overnight", "overlay"])
-    p.add_argument("--dir", help="experiment folder (default: pick a file in a dialog)")
-    p.add_argument("--out", help="output folder (default: OUTPUT_BASE, else the experiment folder)")
-    p.add_argument("--no-sheet", action="store_true",
-                   help="overnight only: skip the Google Sheets protocol-settings lookup")
-    args = p.parse_args()
-    if args.mode == "overnight":
-        overnight_run_plots(args.dir, args.out, use_protocol_sheet=not args.no_sheet)
-    else:
-        overlay_run_plots(args.dir, args.out)
+# %%
