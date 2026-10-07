@@ -416,7 +416,8 @@ def read_run_data(files):
 
 # ChannelData exports are huge (~2 GB per overnight run); only these columns are used.
 CHANNEL_COLS = {"ChannelID", "RunIDRecord", "TimeStamp", "Timestamp", "ViableChannel",
-                "TotalEventRate", "Baseline", "SignalRMS", "LevelOne"}
+                "TotalEventRate", "Baseline", "SignalRMS", "LevelOne",
+                "Samples", "MinuteInBlock"}  # last two only in metric_avg_comparisons/export_run_metrics_avg.bat exports
 CHANNEL_FLOAT32 = ["TotalEventRate", "Baseline", "SignalRMS", "LevelOne"]
 
 
@@ -428,7 +429,9 @@ def read_channel_data(files, per_minute=False):
         d = pd.read_csv(f, low_memory=False, usecols=lambda c: c in CHANNEL_COLS)
         n_read = len(d)
         ts_col = "TimeStamp" if "TimeStamp" in d.columns else "Timestamp"
-        if per_minute and ts_col in d.columns and pd.api.types.is_numeric_dtype(d[ts_col]):
+        # (an averaged export, with its Samples column, is already one row per channel per minute)
+        if (per_minute and "Samples" not in d.columns and ts_col in d.columns
+                and pd.api.types.is_numeric_dtype(d[ts_col])):
             secs = d[ts_col].astype(float)
             d = d[np.round(secs - secs.min(), 0) % 60 == 0]  # matches Time_sec in the markup
         for c in CHANNEL_FLOAT32:
@@ -446,6 +449,25 @@ def read_channel_data(files, per_minute=False):
     del frames
     out["filename"] = out["filename"].astype("category")
     return out
+
+
+def per_minute_rows(channel_data):
+    """The ChannelData rows the overnight figures use: one snapshot per whole minute of run time,
+    or every row of an averaged export (metric_avg_comparisons/export_run_metrics_avg.bat), which is
+    already per minute."""
+    if "Samples" in channel_data.columns:
+        return channel_data
+    return channel_data[channel_data["Time_sec"] % 60 == 0]
+
+
+def align_to_system_clock(sys_d, ch_d):
+    """Put a run's ChannelData on its SystemMetrics clock (time 0 = first SystemMetrics reading).
+    Identical for full/snapshot exports; matters if an averaged export skipped the first minute."""
+    t0 = sys_d["Time_abs_sec"].min()
+    ch_d = ch_d.copy()
+    t = ch_d["Time_abs_sec"] - t0
+    ch_d["Time"], ch_d["Time_minutes"], ch_d["Time_sec"] = t / 3600, t / 60, np.round(t, 0)
+    return ch_d
 
 
 def read_experiment(experiment_dir, channel_per_minute=False):
@@ -833,7 +855,7 @@ def overnight_run_plots(experiment_dir=None, out_dir=None, use_protocol_sheet=Tr
 
     # ChannelData: one row per minute of run time (a snapshot, not a rolling average)
     system_metrics, channel_data, run_data = read_experiment(experiment_dirs, channel_per_minute=True)
-    channel_data = channel_data[channel_data["Time_sec"] % 60 == 0]
+    channel_data = per_minute_rows(channel_data)
 
     saved = []
     for run_id in run_ids:
@@ -842,6 +864,7 @@ def overnight_run_plots(experiment_dir=None, out_dir=None, use_protocol_sheet=Tr
         if sys_d.empty or ch_d.empty:
             print(f"Skipping {run_id}: missing SystemMetrics or ChannelData")
             continue
+        ch_d = align_to_system_clock(sys_d, ch_d)
         fig = _overnight_run_figure(run_id, sys_d, ch_d, run_data, protocol_settings)
         saved.append(_save(fig, os.path.join(base, f"{run_id}_overnight_instrument_metrics{stamp}.jpg")))
     return saved
@@ -1071,14 +1094,17 @@ def overlay_run_plots(experiment_dir=None, out_dir=None):
 
 
 # %% Run
-if MODE == "overnight":
-    outputs = overnight_run_plots(EXPERIMENT_DIR, OUT_DIR, use_protocol_sheet=USE_PROTOCOL_SHEET)
-elif MODE == "sequential":
-    outputs = sequential_run_plots(EXPERIMENT_DIR, OUT_DIR, use_protocol_sheet=USE_PROTOCOL_SHEET)
-elif MODE == "overlay":
-    outputs = overlay_run_plots(EXPERIMENT_DIR, OUT_DIR)
-else:
-    raise ValueError(f"Unknown MODE: {MODE!r}")
-outputs
+# (guarded so other scripts, e.g. metric_avg_comparisons/compare_overnight_exports.py, can import this file's functions
+#  without generating figures; running cells in VS Code or `python instrument_run_metrics.py` still runs it)
+if __name__ == "__main__":
+    if MODE == "overnight":
+        outputs = overnight_run_plots(EXPERIMENT_DIR, OUT_DIR, use_protocol_sheet=USE_PROTOCOL_SHEET)
+    elif MODE == "sequential":
+        outputs = sequential_run_plots(EXPERIMENT_DIR, OUT_DIR, use_protocol_sheet=USE_PROTOCOL_SHEET)
+    elif MODE == "overlay":
+        outputs = overlay_run_plots(EXPERIMENT_DIR, OUT_DIR)
+    else:
+        raise ValueError(f"Unknown MODE: {MODE!r}")
+    print(outputs)
 
 # %%
