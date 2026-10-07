@@ -3,25 +3,33 @@
 # Python port of instrument_run_metrics.R, laid out as `# %%` cells (VS Code "Run Cell" / Interactive Window,
 # Spyder, or PyCharm scientific mode). Run the cells top to bottom; set your options in the **Run settings** cell.
 #
-# Two report types (same as the R version):
-#   * overnight_run_plots() - single-run version (e.g. 16 h data collection), per-channel data,
-#                             one JPG per run ID found in the chosen folder.
-#   * overlay_run_plots()   - overlay version (e.g. instrument audit, tag titration), system-wide
-#                             means for multiple injections onto the same detector, one JPG per folder.
+# Report types (MODE):
+#   * "overnight"  - overnight_run_plots(): single-run version (e.g. 16 h data collection),
+#                    per-channel data, one JPG per run ID found.
+#   * "sequential" - sequential_run_plots(): the overnight figure, but with every injection onto the
+#                    same detector (wafer-die) appended end to end on one shared clock (gaps between
+#                    runs are kept), one table row per injection. One JPG per detector.
+#   * "overlay"    - overlay_run_plots(): overlay version (e.g. instrument audit, tag titration),
+#                    system-wide means for multiple injections onto the same detector, each starting
+#                    at time 0. One JPG covering everything read in.
 #
-# Expected input: one experiment folder containing CSVs (with header rows) whose names contain
-# SystemMetrics, ChannelData and RunData, e.g. ChannelData_<SampleID>.csv.
+# Expected input: CSVs (with header rows) whose names contain SystemMetrics, ChannelData and
+# RunData, e.g. ChannelData_<SampleID>.csv. EXPERIMENT_DIR can be one folder or a list of folders
+# (e.g. one export folder per injection); files from all of them are combined.
 #
 # Packages: pandas, numpy, matplotlib, statsmodels (geom_smooth equivalent), gspread (Google Sheets).
 # tkinter (file picker) ships with standard Python on Windows.
 
 # %% Run settings
-MODE = "overnight"           # "overnight" or "overlay"
-EXPERIMENT_DIR = r"C:\Users\luce\Code\data\TC043_D008-02B63894w16-205B21a"        # e.g. r"\\PROTON\TechDevGroup\...\20250429_tag_titration_human"; None = file picker
-OUT_DIR = None               # None = OUTPUT_BASE below, else the experiment folder
+MODE = "sequential"           # "overnight", "sequential" or "overlay"
+EXPERIMENT_DIR = r"C:\Users\luce\Code\data\combined"       # e.g. r"\\PROTON\TechDevGroup\...\20250429_tag_titration_human"; None = file picker
+OUT_DIR = r"\\proton\TechDevGroup\Users\Luce\Results\Instrument_Report_Analysis"               # None = OUTPUT_BASE below, else the experiment folder
 USE_PROTOCOL_SHEET = False    # overnight only: look up protocol settings in Google Sheets
                              # (needs %APPDATA%\gspread\credentials.json; skipped with a warning if missing)
 SHOW_INLINE = True           # also display each figure when running in cells
+# EXPERIMENT_DIR can also be a list of folders, e.g.
+# EXPERIMENT_DIR = [r"C:\Users\luce\Code\data\TC043_D008-02B63894w16-205B21a",
+#                   r"C:\Users\luce\Code\data\TC043_D008-02B63894w16-205B21b"]
 
 # %% Imports
 import os
@@ -61,6 +69,11 @@ JPG_DPI = 300  # ggsave default
 R_GREEN = "#00FF00"
 R_GRAY = "#BEBEBE"
 
+# Sequential mode: gaps between injections longer than GAP_BRIDGE_MIN_HR are drawn as a short
+# break GAP_BRIDGE_WIDTH_HR wide; tick labels keep the real run time.
+GAP_BRIDGE_MIN_HR = 2.0
+GAP_BRIDGE_WIDTH_HR = 1.0
+
 
 # %% Helpers (stand-ins for tidyverse / ggplot behaviour)
 # --------------------------------------------------------------------------------------------------
@@ -78,11 +91,15 @@ def concat_csv_files(files, **read_csv_kwargs):
         frames.append(d)
     if not frames:
         return pd.DataFrame(columns=["filename"])
-    return pd.concat(frames, ignore_index=True, sort=False)
+    out = pd.concat(frames, ignore_index=True, sort=False)
+    out["filename"] = out["filename"].astype("category")
+    return out
 
 
 def is_viable(s):
     """ViableChannel == "TRUE" regardless of whether pandas read it as bool or text."""
+    if pd.api.types.is_bool_dtype(s):
+        return s.fillna(False).astype(bool)  # fast path; avoids building millions of strings
     return s.astype(str).str.strip().str.upper() == "TRUE"
 
 
@@ -205,17 +222,48 @@ def choose_experiment_dir():
     return os.path.dirname(path)
 
 
-def output_prefix(experiment_dir, out_dir):
-    base = out_dir or OUTPUT_BASE or experiment_dir
+def as_dir_list(experiment_dir):
+    """EXPERIMENT_DIR may be one folder, a list/tuple of folders, or None (file picker)."""
+    if experiment_dir is None:
+        return [choose_experiment_dir()]
+    if isinstance(experiment_dir, (str, os.PathLike)):
+        return [os.fspath(experiment_dir)]
+    return [os.fspath(d) for d in experiment_dir]
+
+
+def output_prefix(experiment_dirs, out_dir):
+    """Default output folder: out_dir, else OUTPUT_BASE, else the (first) experiment folder."""
+    base = out_dir or OUTPUT_BASE or as_dir_list(experiment_dirs)[0]
     os.makedirs(base, exist_ok=True)
     return base
 
 
-def list_files(experiment_dir, pattern):
-    """list.files(dir, pattern=..., full.names=TRUE) - regex on file names, sorted."""
+def list_files(experiment_dirs, pattern):
+    """list.files(dir, pattern=..., full.names=TRUE) over one or more folders - regex on file names.
+    A file name found in more than one folder is only used once (first folder wins)."""
     rx = re.compile(pattern)
-    return sorted(os.path.join(experiment_dir, f) for f in os.listdir(experiment_dir)
-                  if rx.search(f) and os.path.isfile(os.path.join(experiment_dir, f)))
+    seen, out = set(), []
+    for d in as_dir_list(experiment_dirs):
+        for f in sorted(os.listdir(d)):
+            path = os.path.join(d, f)
+            if not (rx.search(f) and os.path.isfile(path)):
+                continue
+            if f in seen:
+                print(f"WARNING: {f} found in more than one folder; using the first copy only.")
+                continue
+            seen.add(f)
+            out.append(path)
+    return out
+
+
+def find_run_ids(experiment_dirs):
+    """Sample IDs present: between Data_/Metrics_ and .csv (tolerates sample-id typos)."""
+    run_ids = []
+    for path in list_files(experiment_dirs, r"(?:Data|Metrics)_.+\.csv$"):
+        rid = _first(r"(?:Data|Metrics)_(.+)(?=\.csv)", os.path.basename(path))
+        if rid is not None and rid not in run_ids:
+            run_ids.append(rid)
+    return run_ids
 
 def show_figure(fig):
     """Display a figure inline when running in cells (VS Code / Jupyter); no-op from a plain terminal."""
@@ -252,10 +300,15 @@ def _parse_run_id(filename):
     die = run_id[26:29] or None                       # str_sub(RunID, 27, 29)  (still positional)
     wafer = _first(r"[Ww].+(?=-)", run_id)            # W/w up to (last) following dash
     instrument = run_id[23:26] or None                # str_sub(RunID, 24, 26)  (still positional)
-    if "_" in run_id:
-        injection = _first(r"[A-Za-z]_.*$", run_id)  # last letter before underscore to end
+    # Injection comes from the last dash-separated segment only (e.g. "205B21a" -> "a",
+    # "205B21a_rerun" -> "a_rerun"); sample IDs like "TC043_D008-..." have underscores earlier on.
+    tail = run_id.rsplit("-", 1)[-1]
+    if "_" in tail:
+        injection = _first(r"[A-Za-z]_.*$", tail)  # last letter before underscore to end
     else:
-        injection = _first(r"[A-Za-z]$", run_id)     # last letter
+        injection = _first(r"[A-Za-z]$", tail)     # last letter
+    if injection is None:
+        injection = tail  # fall back to the whole segment so runs never silently drop out
     return dict(RunID=run_id, Sample=sample, Die=die, Wafer=wafer,
                 Instrument=instrument, Injection=injection)
 
@@ -267,7 +320,10 @@ def run_metrics_metadata_markup(df):
     meta["InjectionSample"] = meta["Injection"].astype(str) + " " + meta["Sample"].astype(str)
     meta["WaferDie"] = meta["Wafer"].astype(str) + "-" + meta["Die"].astype(str)
     df = df.drop(columns=[c for c in meta.columns if c != "filename" and c in df.columns])
-    df = df.merge(meta, on="filename", how="left")
+    meta = meta.set_index("filename")
+    fn = df["filename"].astype(str)
+    for col in meta.columns:  # categoricals: one copy of each label instead of one per row
+        df[col] = fn.map(meta[col]).astype("category")
 
     # Time fields, per file
     ts = df["Timestamp"]
@@ -278,7 +334,8 @@ def run_metrics_metadata_markup(df):
         if getattr(parsed.dt, "tz", None) is not None:
             parsed = parsed.dt.tz_convert(None)
         secs = (parsed - pd.Timestamp("1970-01-01")).dt.total_seconds()
-    t0 = secs.groupby(df["filename"]).transform("min")
+    df["Time_abs_sec"] = secs  # absolute clock (used to put several runs on one time axis)
+    t0 = secs.groupby(df["filename"], observed=True).transform("min")
     df["Time_min"] = t0
     time_sec = secs - t0
     df["Time_minutes"] = time_sec / 60
@@ -357,9 +414,43 @@ def read_run_data(files):
     return pd.concat(frames, ignore_index=True, sort=False)
 
 
-def read_experiment(experiment_dir):
+# ChannelData exports are huge (~2 GB per overnight run); only these columns are used.
+CHANNEL_COLS = {"ChannelID", "RunIDRecord", "TimeStamp", "Timestamp", "ViableChannel",
+                "TotalEventRate", "Baseline", "SignalRMS", "LevelOne"}
+CHANNEL_FLOAT32 = ["TotalEventRate", "Baseline", "SignalRMS", "LevelOne"]
+
+
+def read_channel_data(files, per_minute=False):
+    """per_minute=True keeps one row per channel per minute of run time (the same rows the
+    overnight figures use), dropping the rest file by file so memory stays low."""
+    frames = []
+    for f in files:
+        d = pd.read_csv(f, low_memory=False, usecols=lambda c: c in CHANNEL_COLS)
+        n_read = len(d)
+        ts_col = "TimeStamp" if "TimeStamp" in d.columns else "Timestamp"
+        if per_minute and ts_col in d.columns and pd.api.types.is_numeric_dtype(d[ts_col]):
+            secs = d[ts_col].astype(float)
+            d = d[np.round(secs - secs.min(), 0) % 60 == 0]  # matches Time_sec in the markup
+        for c in CHANNEL_FLOAT32:
+            if c in d.columns:
+                d[c] = pd.to_numeric(d[c], errors="coerce").astype("float32")
+        if "ChannelID" in d.columns:
+            d["ChannelID"] = pd.to_numeric(d["ChannelID"], downcast="integer")
+        d["filename"] = os.path.basename(f)
+        frames.append(d)
+        kept = f" (kept {len(d):,}, one per minute)" if len(d) != n_read else ""
+        print(f"Read {os.path.basename(f)}: {n_read:,} rows{kept}")
+    if not frames:
+        return pd.DataFrame(columns=["filename"])
+    out = pd.concat(frames, ignore_index=True, sort=False)
+    del frames
+    out["filename"] = out["filename"].astype("category")
+    return out
+
+
+def read_experiment(experiment_dir, channel_per_minute=False):
     system_metrics = concat_csv_files(list_files(experiment_dir, "SystemMetrics"))
-    channel_data = concat_csv_files(list_files(experiment_dir, "ChannelData"))
+    channel_data = read_channel_data(list_files(experiment_dir, "ChannelData"), per_minute=channel_per_minute)
     run_data = read_run_data(list_files(experiment_dir, "RunData"))
     system_metrics = run_metrics_metadata_markup(system_metrics)
     channel_data = run_metrics_metadata_markup(channel_data)
@@ -395,7 +486,7 @@ def _set_minor_midpoints(ax):
 PT = dict(s=0.4, linewidths=0, rasterized=True)  # ~ ggplot geom_point(size=0.001)
 
 
-def _draw_run_table(ax, table, protocol_cols, avg_cols):
+def _draw_run_table(ax, table, protocol_cols, avg_cols, avg_label="Average Values for Full Run"):
     """gt table with two coloured column spanners, drawn with matplotlib."""
     ax.set_axis_off()
     ax.set_xlim(0, 1)
@@ -437,7 +528,7 @@ def _draw_run_table(ax, table, protocol_cols, avg_cols):
         ax.text((x0 + x1) / 2, y_head_top + h_span / 2, label, ha="center", va="center", fontsize=fs)
 
     span("Protocol Settings", protocol_cols, "lightblue")
-    span("Average Values for Full Run", avg_cols, "lightgreen")
+    span(avg_label, avg_cols, "lightgreen")
     for i, h in enumerate(headers):
         ax.text((x[i] + x[i + 1]) / 2, y_body_top + h_head / 2, h, ha="center", va="center",
                 fontsize=fs, linespacing=1.1)
@@ -449,15 +540,124 @@ def _draw_run_table(ax, table, protocol_cols, avg_cols):
         ax.plot([x[0], x[-1]], [yy, yy], color="#D3D3D3", lw=lw, clip_on=False)
 
 
-def _overnight_run_figure(run_id, sys_d, ch_d, run_data, protocol_settings):
+def _hr_breaks(max_hr, step):
+    """Axis breaks every `step` hours, widened (x2) for long time spans so labels don't collide."""
+    while max_hr / step > 24:
+        step *= 2
+    return seq(0, max_hr, step)
+
+
+class TimeMap:
+    """Shortens long gaps between runs on the time axis. Data are plotted at display time
+    disp(t); tick labels show real time t. gaps = [(start_hr, end_hr), ...] in real hours."""
+
+    def __init__(self, gaps, width=GAP_BRIDGE_WIDTH_HR):
+        self.gaps = sorted(gaps)
+        self.width = width
+
+    def disp(self, t):
+        t = np.asarray(t, dtype=float)
+        out = t.copy()
+        for g0, g1 in self.gaps:
+            inside = (t > g0) & (t < g1)
+            out = np.where(inside, out - (t - g0) + (t - g0) / (g1 - g0) * self.width, out)
+            out = np.where(t >= g1, out - (g1 - g0 - self.width), out)
+        return out
+
+    def real(self, d):
+        d = float(d)
+        for g0, g1 in self.gaps:
+            g0_d = float(self.disp(g0))
+            if d >= g0_d + self.width:
+                d += (g1 - g0 - self.width)
+            elif d > g0_d:
+                d = g0 + (d - g0_d) / self.width * (g1 - g0)
+        return d
+
+    def in_gap(self, t):
+        return any(g0 < t < g1 for g0, g1 in self.gaps)
+
+    def bands(self):  # (display start, display end, real gap length) of each bridge
+        return [(float(self.disp(g0)), float(self.disp(g0)) + self.width, g1 - g0)
+                for g0, g1 in self.gaps]
+
+
+def _run_averages(sys_d, ch_d):
+    """The "Average Values" columns of the run table, for one run."""
+    viable = is_viable(ch_d["ViableChannel"])
+    lvl1_clean = ch_d["LevelOne"].where(viable & (ch_d["LevelOne"] != LEVEL_ONE_SENTINEL))
+    return {
+        "Total Event Rate": round(float(np.nanmean(sys_d["TotalEventRate"].astype(float)))),
+        "Channel Activity (%)": round(100 * viable.sum() / len(ch_d)),
+        "Active Channel Count": round(float(np.nanmean(sys_d["ActiveChannelCount"].astype(float)))),
+        "Baseline (mV)": round(float(np.nanmean(ch_d["Baseline"].where(viable)))),
+        "Level 1 (uV)": round(float(np.nanmean(lvl1_clean))),
+        "Signal RMS": round(float(np.nanmean(ch_d["SignalRMS"].where(viable))), 4),
+        "Current (uA)": round(float(np.nanmean(sys_d["Current(A)"].astype(float) * 1e6))),
+        "Bias Voltage (V)": round(float(np.nanmean(sys_d["BiasVoltage(V)"].astype(float))), 1),
+    }
+
+
+AVG_COLS = ["Total Event Rate", "Channel Activity (%)", "Active Channel Count", "Baseline (mV)",
+            "Level 1 (uV)", "Signal RMS", "Current (uA)", "Bias Voltage (V)"]
+
+
+def _run_table(run_ids, sys_d, ch_d, run_data, protocol_settings):
+    """One table row per run: RunData metadata (+ protocol settings) and that run's averages."""
+    rd = run_data.loc[run_data["SampleID"].isin(run_ids),
+                      [c for c in RUN_DATA_COLS if c in run_data.columns]]
+    rd = rd.drop_duplicates("SampleID")
+    if protocol_settings is not None:
+        rd = rd.merge(protocol_settings, on=["ProtocolName", "SettingsGroup"], how="left")
+    setting_cols = [c for c in ["Target Baseline (mV)", "Target Bias (V)", "Applied Pressure (psi)"]
+                    if c in rd.columns and rd[c].notna().any()]  # pivot_longer/drop_na/pivot_wider
+    rd = rd.rename(columns={"SampleID": "Sample ID", "ProtocolName": "Protocol",
+                            "SettingsGroup": "Settings", "ReagentLot": "Reagent Lot",
+                            "DetectorLotNumber": "Lot", "DetectorWaferID": "Wafer",
+                            "DetectorDieNumber": "Die"})
+    detector_cols = [c for c in ["Lot", "Wafer", "Die"] if c in rd.columns]  # from RunData Detector* columns
+    sample_cols = ["Sample ID", "Protocol", "Settings"] + setting_cols + detector_cols + ["Reagent Lot"]
+    for c in sample_cols:
+        if c not in rd.columns:
+            rd[c] = None
+    rd = rd.set_index("Sample ID")
+    rows = []
+    for rid in run_ids:  # keep run order; runs missing from RunData still get a row
+        row = {c: (rd.at[rid, c] if rid in rd.index else None) for c in sample_cols[1:]}
+        row = {"Sample ID": rid, **row,
+               **_run_averages(sys_d[sys_d["RunID"] == rid], ch_d[ch_d["RunID"] == rid])}
+        rows.append(row)
+    return pd.DataFrame(rows, columns=sample_cols + AVG_COLS), sample_cols
+
+
+def _overnight_run_figure(run_ids, sys_d, ch_d, run_data, protocol_settings, run_starts=None,
+                          xmap=None):
+    """The overnight figure. `run_ids` is one run ID (overnight mode) or several runs already on a
+    shared clock (sequential mode); `run_starts` = [(start_hr, label), ...] marks each run's start.
+    `xmap` (a TimeMap) means Time is already in display units with long gaps shortened."""
+    if isinstance(run_ids, str):
+        run_ids = [run_ids]
+    multi = len(run_ids) > 1
     rng = np.random.default_rng(1)
     max_sys = sys_d["Time"].max()
     max_ch = ch_d["Time"].max()
     viable = is_viable(ch_d["ViableChannel"])
     chv = ch_d[viable]
+    XL = "Run Time (hrs)" if xmap is None or not xmap.gaps else \
+        f"Run Time (hrs; gaps > {GAP_BRIDGE_MIN_HR:g} h shortened)"
 
-    fig = plt.figure(figsize=(16.5, 9))
-    gs = fig.add_gridspec(4, 3, height_ratios=[0.42, 1, 1, 1], hspace=0.45, wspace=0.22,
+    def set_x(a, max_disp, step):
+        if xmap is None or not xmap.gaps:
+            set_scale(a, "x", 0, max_disp, _hr_breaks(max_disp, step))
+            return
+        br = [b for b in _hr_breaks(xmap.real(max_disp), step) if not xmap.in_gap(b)]
+        set_scale(a, "x", 0, max_disp, xmap.disp(br))
+        a.set_xticklabels([fmt_value(float(b)) for b in br])
+
+    table, sample_cols = _run_table(run_ids, sys_d, ch_d, run_data, protocol_settings)
+    tbl_h = 0.42 + 0.10 * (len(table) - 1)  # taller table band for more rows
+    fig = plt.figure(figsize=(16.5, 9 + 1.3 * (tbl_h - 0.42)))
+    gs = fig.add_gridspec(4, 3, height_ratios=[tbl_h, 1, 1, 1], hspace=0.45, wspace=0.22,
                           left=0.04, right=0.96, top=0.97, bottom=0.06)
     ax_tbl = fig.add_subplot(gs[0, :])
     ax = {name: fig.add_subplot(gs[r, c]) for name, (r, c) in {
@@ -469,9 +669,9 @@ def _overnight_run_figure(run_id, sys_d, ch_d, run_data, protocol_settings):
     def sys_scatter(a, col, color, ylab, lo, hi, by):
         d = sys_d[within(sys_d[col], lo, hi)]
         a.scatter(d["Time"], d[col], color=color, **PT)
-        set_scale(a, "x", 0, max_sys, seq(0, max_sys, 2))
+        set_x(a, max_sys, 2)
         set_scale(a, "y", lo, hi, seq(lo, hi, by))
-        _style_overnight(a, "Run Time (hrs)", ylab)
+        _style_overnight(a, XL, ylab)
 
     sys_scatter(ax["TERsys"], "TotalEventRate", "hotpink", "Total Event Rate (system)", 0, 800, 200)
     sys_scatter(ax["E"], "ActiveChannelCount", R_GREEN, "Active Channel Count", 0, 260, 50)
@@ -484,7 +684,7 @@ def _overnight_run_figure(run_id, sys_d, ch_d, run_data, protocol_settings):
     a.scatter(sys_d["Time"][m], cur[m], color="darkblue", **PT)
     m = within(bias_scaled, 50, 200)
     a.scatter(sys_d["Time"][m], bias_scaled[m], color="orange", **PT)
-    set_scale(a, "x", 0, max_sys, seq(0, max_sys, 2))
+    set_x(a, max_sys, 2)
     set_scale(a, "y", 50, 200, seq(50, 200, 25))
     sec = a.secondary_yaxis("right", functions=(lambda y: y / 30 - 5 / 3, lambda v: (v + 5 / 3) * 30))
     sec.set_ylabel("Bias Voltage (V)", fontsize=8, color="black")
@@ -495,17 +695,10 @@ def _overnight_run_figure(run_id, sys_d, ch_d, run_data, protocol_settings):
     a.text(0.26 * max_sys, 200, "Current (uA)", ha="left", va="center", fontsize=8)
     a.scatter([0.5 * max_sys], [200], color="orange", s=12, zorder=3)
     a.text(0.51 * max_sys, 200, "Bias Voltage (V)", ha="left", va="center", fontsize=8)
-    _style_overnight(a, "Run Time (hrs)", "Current (uA)")
+    _style_overnight(a, XL, "Current (uA)")
 
     norm_er = sys_d.assign(TotalEventRate_norm=sys_d["TotalEventRate"].astype(float)
                            / sys_d["ActiveChannelCount"].astype(float))
-
-    sys_avgs = {
-        "Current (uA)": round(np.nanmean(sys_d["Current(A)"].astype(float) * 1e6)),
-        "Bias Voltage (V)": round(np.nanmean(sys_d["BiasVoltage(V)"].astype(float)), 1),
-        "Active Channel Count": round(np.nanmean(sys_d["ActiveChannelCount"].astype(float))),
-        "Total Event Rate": round(np.nanmean(sys_d["TotalEventRate"].astype(float))),
-    }
 
     # ---- panels from ChannelData ----
     a = ax["TER"]
@@ -513,9 +706,9 @@ def _overnight_run_figure(run_id, sys_d, ch_d, run_data, protocol_settings):
     ch_ids = np.sort(ch_d["ChannelID"].unique())
     pal = dict(zip(ch_ids, hue_pal(len(ch_ids))))
     a.scatter(d["Time"], d["TotalEventRate"], c=d["ChannelID"].map(pal).tolist(), **PT)
-    set_scale(a, "x", 0, max_ch, seq(0, max_ch, 1))
+    set_x(a, max_ch, 1)
     set_scale(a, "y", 0, 8, seq(0, 8, 1))
-    _style_overnight(a, "Run Time (hrs)", "Total Event Rate (channel)")
+    _style_overnight(a, XL, "Total Event Rate (channel)")
 
     a = ax["CER"]
     nd = norm_er[within(norm_er["TotalEventRate_norm"], 0, 6) & (norm_er["Time"] <= max_ch)]
@@ -526,26 +719,29 @@ def _overnight_run_figure(run_id, sys_d, ch_d, run_data, protocol_settings):
     d = d[within(d["TotalEventRate"], 0, 6)]  # scale limits remove points before smoothing
     for i, cat in enumerate(bins.cat.categories):
         g = d[d["x_bins"] == cat]
-        xs, ys = lowess_smooth(g["Time"], g["TotalEventRate"])
-        a.plot(xs, ys, color=bin_cols[i], lw=1)
-    set_scale(a, "x", 0, max_ch, seq(0, max_ch, 1))
+        for _, gr in g.groupby("RunID", observed=True):  # smooth each run separately (no line across gaps)
+            xs, ys = lowess_smooth(gr["Time"], gr["TotalEventRate"])
+            a.plot(xs, ys, color=bin_cols[i], lw=1)
+    set_x(a, max_ch, 1)
     set_scale(a, "y", 0, 6, seq(0, 6, 1))
     a.scatter([0], [6], color=R_GRAY, s=6, zorder=3)
-    a.text(0.01 * max_sys, 6, "Total event rate / Active channel count", ha="left", va="center", fontsize=8)
+    # legend positions scale with this panel's own x range (max_ch; the R code used max_sys,
+    # which is the same value whenever SystemMetrics and ChannelData cover the same span)
+    a.text(0.01 * max_ch, 6, "Total event rate / Active channel count", ha="left", va="center", fontsize=8)
     for i, lab in enumerate(["Ch1-51", "52-102", "103-153", "154-204", "205-256"]):
-        xp = (0.5 + 0.1 * i) * max_sys
+        xp = (0.5 + 0.1 * i) * max_ch
         a.scatter([xp], [6], color=bin_cols[i], s=6, marker="s", zorder=3)
-        a.text(xp + 0.01 * max_sys, 6, lab, ha="left", va="center", fontsize=6.3)
-    _style_overnight(a, "Run Time (hrs)", "Total Event Rate")
+        a.text(xp + 0.01 * max_ch, 6, lab, ha="left", va="center", fontsize=6.3)
+    _style_overnight(a, XL, "Total Event Rate")
 
     a = ax["B"]
     d = ch_d[within(ch_d["ChannelID"], 0, 260)]
     v = is_viable(d["ViableChannel"])
     a.scatter(d["Time"][~v], d["ChannelID"][~v], color="red", **PT)
     a.scatter(d["Time"][v], d["ChannelID"][v], color=R_GREEN, **PT)
-    set_scale(a, "x", 0, max_ch, seq(0, max_ch, 1))
+    set_x(a, max_ch, 1)
     set_scale(a, "y", 0, 260, seq(0, 260, 50))
-    _style_overnight(a, "Run Time (hrs)", "Channel Viability")
+    _style_overnight(a, XL, "Channel Viability")
 
     a = ax["Base"]
     base_mean = chv.groupby("Time", as_index=False)["Baseline"].mean()
@@ -553,9 +749,9 @@ def _overnight_run_figure(run_id, sys_d, ch_d, run_data, protocol_settings):
     a.scatter(d["Time"], d["Baseline"], color="deepskyblue", **PT)
     bm = base_mean[within(base_mean["Baseline"], 500, 2500)]
     a.scatter(bm["Time"], bm["Baseline"], color="black", **PT)
-    set_scale(a, "x", 0, max_ch, seq(0, max_ch, 1))
+    set_x(a, max_ch, 1)
     set_scale(a, "y", 500, 2500, seq(500, 2500, 500))
-    _style_overnight(a, "Run Time (hrs)", "Baseline (mV)")
+    _style_overnight(a, XL, "Baseline (mV)")
 
     a = ax["RMS"]
     d = chv[chv["SignalRMS"] < 0.08].copy()  # should check why this threshold value
@@ -563,9 +759,9 @@ def _overnight_run_figure(run_id, sys_d, ch_d, run_data, protocol_settings):
     a.scatter(jitter(d["Time"], rng), jitter(d["SignalRMS"], rng), color="#79CDCD", **PT)  # darkslategray3
     mm = d.drop_duplicates("Time")
     a.scatter(mm["Time"], mm["Mean"], color="black", **PT)
-    set_scale(a, "x", 0, max_ch, seq(0, max_ch, 1))
+    set_x(a, max_ch, 1)
     set_scale(a, "y", 0, 0.08)
-    _style_overnight(a, "Run Time (hrs)", "Signal RMS")
+    _style_overnight(a, XL, "Signal RMS")
 
     a = ax["LVL1"]
     d = chv[chv["LevelOne"] != LEVEL_ONE_SENTINEL].copy()
@@ -576,71 +772,67 @@ def _overnight_run_figure(run_id, sys_d, ch_d, run_data, protocol_settings):
     mm = d.drop_duplicates("Time")
     mm = mm[within(mm["Mean"], 300, 1500)]
     a.scatter(mm["Time"], mm["Mean"], color="black", s=3, linewidths=0, rasterized=True)
-    set_scale(a, "x", 0, max_ch, seq(0, max_ch, 1))
+    set_x(a, max_ch, 1)
     set_scale(a, "y", 300, 1500)
-    _style_overnight(a, "Run Time (hrs)", "Level 1 (uV)")
+    _style_overnight(a, XL, "Level 1 (uV)")
 
     for a in ax.values():
         _set_minor_midpoints(a)
 
-    lvl1_clean = ch_d["LevelOne"].where(viable & (ch_d["LevelOne"] != LEVEL_ONE_SENTINEL))
-    ch_avgs = {
-        "Channel Activity (%)": round(100 * viable.sum() / len(ch_d)),
-        "Baseline (mV)": round(np.nanmean(ch_d["Baseline"].where(viable))),
-        "Level 1 (uV)": round(np.nanmean(lvl1_clean)),
-        "Signal RMS": round(np.nanmean(ch_d["SignalRMS"].where(viable)), 4),
-    }
+    # ---- sequential mode: mark where each injection starts ----
+    if multi and run_starts:
+        from matplotlib.transforms import blended_transform_factory
+        for a in ax.values():
+            tr = blended_transform_factory(a.transData, a.transAxes)
+            for k, (t_hr, label) in enumerate(run_starts):
+                if k > 0:
+                    a.axvline(t_hr, color="#555555", lw=0.6, ls="--", zorder=0.5)
+                a.text(t_hr, 1.01, label, transform=tr, ha="left", va="bottom",
+                       fontsize=7, color="#555555", clip_on=False)
 
-    # ---- run metadata from RunData + protocol settings ----
-    rd = run_data.loc[run_data["SampleID"] == run_id,
-                      [c for c in RUN_DATA_COLS if c in run_data.columns]]
-    if protocol_settings is not None:
-        rd = rd.merge(protocol_settings, on=["ProtocolName", "SettingsGroup"], how="left")
-    setting_cols = [c for c in ["Target Baseline (mV)", "Target Bias (V)", "Applied Pressure (psi)"]
-                    if c in rd.columns and rd[c].notna().any()]  # pivot_longer/drop_na/pivot_wider
-    rd = rd.rename(columns={"SampleID": "Sample ID", "ProtocolName": "Protocol",
-                            "SettingsGroup": "Settings", "ReagentLot": "Reagent Lot",
-                            "DetectorLotNumber": "Lot", "DetectorWaferID": "Wafer",
-                            "DetectorDieNumber": "Die"})
-    detector_cols = [c for c in ["Lot", "Wafer", "Die"] if c in rd.columns]  # from RunData Detector* columns
-    sample_cols = ["Sample ID", "Protocol", "Settings"] + setting_cols + detector_cols + ["Reagent Lot"]
-    rd = rd[sample_cols].reset_index(drop=True)
-    if rd.empty:
-        rd = pd.DataFrame([{c: (run_id if c == "Sample ID" else None) for c in sample_cols}])
+    # ---- sequential mode: shortened gaps drawn as a shaded bridge ----
+    if xmap is not None:
+        for a in ax.values():
+            for x0, x1, gap_hr in xmap.bands():
+                a.axvspan(x0, x1, color="#EDEDED", lw=0, zorder=0.4)
+                a.text((x0 + x1) / 2, 0.5, f"{gap_hr:.1f} h gap", transform=a.get_xaxis_transform(),
+                       rotation=90, ha="center", va="center", fontsize=6, color="#777777")
 
-    avg_cols = ["Total Event Rate", "Channel Activity (%)", "Active Channel Count", "Baseline (mV)",
-                "Level 1 (uV)", "Signal RMS", "Current (uA)", "Bias Voltage (V)"]
-    avgs = {**ch_avgs, **sys_avgs}
-    table = rd.copy()
-    for c in avg_cols:
-        table[c] = avgs[c]
-    _draw_run_table(ax_tbl, table, sample_cols[1:], avg_cols)
+    span_label = "Average Values per Injection" if multi else "Average Values for Full Run"
+    _draw_run_table(ax_tbl, table, sample_cols[1:], AVG_COLS, avg_label=span_label)
     return fig
+
+
+def _protocol_settings_or_none(use_protocol_sheet):
+    if not use_protocol_sheet:
+        return None
+    try:
+        return build_protocol_settings_df()
+    except Exception as e:  # e.g. no gspread credentials.json on this PC, or no network
+        print(f"WARNING: skipping Google Sheets protocol lookup ({type(e).__name__}: {e}).\n"
+              "         The table will omit Target Baseline / Target Bias / Applied Pressure. "
+              "Set USE_PROTOCOL_SHEET = False to silence this.")
+        return None
+
+
+def _save(fig, path):
+    fig.savefig(path, dpi=JPG_DPI)
+    show_figure(fig)
+    plt.close(fig)
+    print("Saved", path)
+    return path
 
 
 # %% Overnight (single-run) report - driver
 def overnight_run_plots(experiment_dir=None, out_dir=None, use_protocol_sheet=True):
-    experiment_dir = experiment_dir or choose_experiment_dir()
-    protocol_settings = None
-    if use_protocol_sheet:
-        try:
-            protocol_settings = build_protocol_settings_df()
-        except Exception as e:  # e.g. no gspread credentials.json on this PC, or no network
-            print(f"WARNING: skipping Google Sheets protocol lookup ({type(e).__name__}: {e}).\n"
-                  "         The table will omit Target Baseline / Target Bias / Applied Pressure. "
-                  "Set USE_PROTOCOL_SHEET = False to silence this.")
+    experiment_dirs = as_dir_list(experiment_dir)
+    protocol_settings = _protocol_settings_or_none(use_protocol_sheet)
     stamp = datetime.now().strftime("_%Y%m%d_%H%M%S")
-    base = output_prefix(experiment_dir, out_dir)
+    base = output_prefix(experiment_dirs, out_dir)
+    run_ids = find_run_ids(experiment_dirs)
 
-    # sample ids present: between Data_/Metrics_ and .csv; tolerates sample-id typos
-    run_ids = []
-    for f in os.listdir(experiment_dir):
-        rid = _first(r"(?:Data|Metrics)_(.+)(?=\.csv)", f)
-        if rid is not None and rid not in run_ids:
-            run_ids.append(rid)
-
-    system_metrics, channel_data, run_data = read_experiment(experiment_dir)
-    # one row per minute of run time (a snapshot, not a rolling average)
+    # ChannelData: one row per minute of run time (a snapshot, not a rolling average)
+    system_metrics, channel_data, run_data = read_experiment(experiment_dirs, channel_per_minute=True)
     channel_data = channel_data[channel_data["Time_sec"] % 60 == 0]
 
     saved = []
@@ -651,12 +843,70 @@ def overnight_run_plots(experiment_dir=None, out_dir=None, use_protocol_sheet=Tr
             print(f"Skipping {run_id}: missing SystemMetrics or ChannelData")
             continue
         fig = _overnight_run_figure(run_id, sys_d, ch_d, run_data, protocol_settings)
-        path = os.path.join(base, f"{run_id}_overnight_instrument_metrics{stamp}.jpg")
-        fig.savefig(path, dpi=JPG_DPI)
-        show_figure(fig)
-        plt.close(fig)
-        print("Saved", path)
-        saved.append(path)
+        saved.append(_save(fig, os.path.join(base, f"{run_id}_overnight_instrument_metrics{stamp}.jpg")))
+    return saved
+
+
+# %% Sequential report (injections on one detector appended end to end) - driver
+def sequential_run_plots(experiment_dir=None, out_dir=None, use_protocol_sheet=True):
+    """Overnight-style figure per detector (wafer-die) with all of its injections on one clock:
+    time 0 = start of the earliest run; later runs keep their real start time, so gaps between
+    injections show as gaps on the x axis."""
+    experiment_dirs = as_dir_list(experiment_dir)
+    protocol_settings = _protocol_settings_or_none(use_protocol_sheet)
+    stamp = datetime.now().strftime("_%Y%m%d_%H%M%S")
+    base = output_prefix(experiment_dirs, out_dir)
+
+    system_metrics, channel_data, run_data = read_experiment(experiment_dirs, channel_per_minute=True)
+
+    saved = []
+    for wd in sorted(unique_in_order(system_metrics["WaferDie"])):
+        sys_d = system_metrics[system_metrics["WaferDie"] == wd].copy()
+        ch_d = channel_data[channel_data["WaferDie"] == wd].copy()
+        if sys_d.empty or ch_d.empty:
+            print(f"Skipping {wd}: missing SystemMetrics or ChannelData")
+            continue
+        # order runs by their real start time
+        starts = sys_d.groupby("RunID", observed=True)["Time_abs_sec"].min().sort_values()
+        run_ids = [r for r in starts.index if (ch_d["RunID"] == r).any()]
+        missing = [r for r in starts.index if r not in run_ids]
+        if missing:
+            print(f"NOTE: {', '.join(missing)} has no ChannelData; left out of the {wd} figure.")
+        sys_d = sys_d[sys_d["RunID"].isin(run_ids)]
+        ch_d = ch_d[ch_d["RunID"].isin(run_ids)]
+
+        # shared clock: everything relative to the earliest timestamp on this detector
+        t0 = min(sys_d["Time_abs_sec"].min(), ch_d["Time_abs_sec"].min())
+        for d in (sys_d, ch_d):
+            t = d["Time_abs_sec"] - t0
+            d["Time"] = t / 3600
+            d["Time_minutes"] = t / 60
+            d["Time_sec"] = np.round(t, 0)
+
+        inj = sys_d.groupby("RunID", observed=True)["Injection"].first()
+        run_starts = [((starts[r] - t0) / 3600, str(inj.get(r, r))) for r in run_ids]
+        # gaps between consecutive runs (end of everything so far -> start of the next run)
+        ends = pd.concat([sys_d.groupby("RunID", observed=True)["Time"].max(),
+                          ch_d.groupby("RunID", observed=True)["Time"].max()], axis=1).max(axis=1)
+        gaps, last_end = [], ends[run_ids[0]]
+        for k in range(1, len(run_ids)):
+            gaps.append((last_end, run_starts[k][0]))
+            last_end = max(last_end, ends[run_ids[k]])
+        print(f"{wd}: {len(run_ids)} run(s) " + ", ".join(f"{lab} @ {t:.1f} h" for t, lab in run_starts)
+              + ("" if not gaps else "; gaps " + ", ".join(f"{g1 - g0:.1f} h" for g0, g1 in gaps)))
+
+        # shorten long gaps on the time axis (tick labels keep the real run time)
+        xmap = TimeMap([(g0, g1) for g0, g1 in gaps if g1 - g0 > GAP_BRIDGE_MIN_HR])
+        if xmap.gaps:
+            for d in (sys_d, ch_d):
+                d["Time"] = xmap.disp(d["Time"].to_numpy())
+            run_starts = [(float(xmap.disp(t)), lab) for t, lab in run_starts]
+
+        fig = _overnight_run_figure(run_ids, sys_d, ch_d, run_data, protocol_settings, run_starts, xmap)
+        stem = os.path.commonprefix(run_ids) if len(run_ids) > 1 else run_ids[0]
+        labels = "+".join(lab for _, lab in run_starts) if len(run_ids) > 1 else ""
+        name = f"{stem}{labels}_sequential_instrument_metrics{stamp}.jpg".replace(os.sep, "_")
+        saved.append(_save(fig, os.path.join(base, name)))
     return saved
 
 
@@ -686,7 +936,7 @@ def _facet_lines(subfig, df, x, y, facets, colors, group="Injection", ylabel="",
             continue
         wd = facets[k]
         d = df[df["WaferDie"] == wd]
-        for g, gd in d.groupby(group, sort=True):
+        for g, gd in d.groupby(group, sort=True, observed=True):
             gd = gd.sort_values(x)
             inj = gd["Injection"].iloc[0]
             a.plot(gd[x], gd[y], color=colors.get(inj, "gray"), lw=0.7)
@@ -705,7 +955,7 @@ def _facet_lines(subfig, df, x, y, facets, colors, group="Injection", ylabel="",
 
 # %% Overlay report - driver
 def overlay_run_plots(experiment_dir=None, out_dir=None):
-    experiment_dir = experiment_dir or choose_experiment_dir()
+    experiment_dir = as_dir_list(experiment_dir)
     stamp = datetime.now().strftime("_%Y%m%d_%H%M%S")
     base = output_prefix(experiment_dir, out_dir)
 
@@ -724,16 +974,27 @@ def overlay_run_plots(experiment_dir=None, out_dir=None):
     sm_res = sm.assign(**{"Resistance (kOhms)": sm["Resistance(Ohms)"].astype(float) / 1000})
 
     # ---- ChannelData panels ----
+    # Each panel plots the across-channel mean at each time point. Computed with groupby
+    # aggregation (one row per time point) rather than transform + drop_duplicates on a full copy
+    # of ChannelData, which needs far too much memory for multi-GB overnight exports.
+    keys = ["WaferDie", "Injection", "InjectionSample"]
     cdv = cd[is_viable(cd["ViableChannel"])]
-    base_df = cdv.copy()
-    base_df["Mean"] = base_df.groupby(["Time_sec", "RunIDRecord"])["Baseline"].transform("mean")
-    rms_df = cdv[cdv["SignalRMS"] < 0.1].copy()
-    rms_df["Mean"] = rms_df.groupby(["Time_sec", "RunIDRecord"])["SignalRMS"].transform("mean")
+
+    def mean_by_time(d, value):  # mean per (Time_sec, RunIDRecord), as in the R code
+        g = d.groupby(keys + ["RunIDRecord", "Time_sec"], observed=True)
+        out = g.agg(Mean=(value, "mean"), Time_minutes=("Time_minutes", "first")).reset_index()
+        return out
+
+    base_df = mean_by_time(cdv, "Baseline")
+    rms_df = mean_by_time(cdv[cdv["SignalRMS"] < 0.1], "SignalRMS")
     rms_df = rms_df[within(rms_df["Mean"], 0, 0.07)]
-    lvl_df = cdv[cdv["LevelOne"] != LEVEL_ONE_SENTINEL].copy()
+    lvl = cdv[cdv["LevelOne"] != LEVEL_ONE_SENTINEL]
     # NB: the R code groups LVL1 by `Time` only (not Time_sec + RunIDRecord like the others),
     # so runs whose timestamps line up get averaged together. Kept as-is to match.
-    lvl_df["Mean"] = lvl_df.groupby("Time")["LevelOne"].transform("mean")
+    lvl_mean = lvl.groupby("Time")["LevelOne"].mean()
+    lvl_df = (lvl.groupby(keys + ["Time"], observed=True)["Time_minutes"].first().reset_index())
+    lvl_df["Mean"] = lvl_df["Time"].map(lvl_mean)
+    del cdv, lvl
 
     def thin(d, grp):  # many identical (x, Mean) rows per channel -> plot each once
         return d.drop_duplicates(["WaferDie", grp, "Injection", "Time_minutes", "Mean"])
@@ -769,7 +1030,9 @@ def overlay_run_plots(experiment_dir=None, out_dir=None):
     inj_rows = sorted(unique_in_order(cd["Injection"]))
     cd_facets = sorted(unique_in_order(cd["WaferDie"]))
     axes = sf.subplots(len(inj_rows), len(cd_facets), sharey=True, sharex="col", squeeze=False)
-    cdb = cd[within(cd["ChannelID"], 0, 260)]
+    # one reading per channel per minute (as in the overnight report); plotting every second
+    # (tens of millions of points for overnight runs) looks the same but is very slow
+    cdb = cd[within(cd["ChannelID"], 0, 260) & (cd["Time_sec"] % 60 == 0)]
     viable = is_viable(cdb["ViableChannel"])
     for i, inj in enumerate(inj_rows):
         for j, wd in enumerate(cd_facets):
@@ -810,6 +1073,8 @@ def overlay_run_plots(experiment_dir=None, out_dir=None):
 # %% Run
 if MODE == "overnight":
     outputs = overnight_run_plots(EXPERIMENT_DIR, OUT_DIR, use_protocol_sheet=USE_PROTOCOL_SHEET)
+elif MODE == "sequential":
+    outputs = sequential_run_plots(EXPERIMENT_DIR, OUT_DIR, use_protocol_sheet=USE_PROTOCOL_SHEET)
 elif MODE == "overlay":
     outputs = overlay_run_plots(EXPERIMENT_DIR, OUT_DIR)
 else:
