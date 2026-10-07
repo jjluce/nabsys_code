@@ -1,0 +1,9 @@
+# Usage (e.g. from \\proton\TechDevGroup\Users\Luce\LabTools after pushd):
+# export_run_metrics.bat "D:\SharedData\System\UnoHost.db" SampleID1 SampleID2 SampleID3 ...
+# export_run_metrics.bat "D:\SharedData\System\UnoHost.db" samples.txt
+# (samples.txt: one Sample ID per line; lines starting with # are ignored)
+# or just double-click it (or drag the .db file onto it) and answer the prompts.
+# The database is opened read-only (SQLite refuses any write to it).
+# Sample IDs to export, one per line (lines starting with # are ignored)
+TC043_D008-02B63894w16-205B21a
+TC043_D008-02B63894w16-205B21b

@@ -421,6 +421,17 @@ CHANNEL_COLS = {"ChannelID", "RunIDRecord", "TimeStamp", "Timestamp", "ViableCha
 CHANNEL_FLOAT32 = ["TotalEventRate", "Baseline", "SignalRMS", "LevelOne"]
 
 
+def _already_per_minute(timestamps, channel_ids):
+    """True if ChannelData has already been thinned to ~one reading per channel per minute
+    (export_run_metrics.bat), judged from the spacing of one channel's readings."""
+    try:
+        first = channel_ids.iloc[0]
+        t = np.sort(np.asarray(timestamps[channel_ids == first], dtype=float))
+        return len(t) > 2 and np.median(np.diff(t)) >= 30
+    except Exception:
+        return False
+
+
 def read_channel_data(files, per_minute=False):
     """per_minute=True keeps one row per channel per minute of run time (the same rows the
     overnight figures use), dropping the rest file by file so memory stays low."""
@@ -429,9 +440,12 @@ def read_channel_data(files, per_minute=False):
         d = pd.read_csv(f, low_memory=False, usecols=lambda c: c in CHANNEL_COLS)
         n_read = len(d)
         ts_col = "TimeStamp" if "TimeStamp" in d.columns else "Timestamp"
-        # (an averaged export, with its Samples column, is already one row per channel per minute)
+        # (averaged exports, with a Samples column, and thinned exports from export_run_metrics.bat
+        #  are already one row per channel per minute; their minutes are counted from the run's
+        #  SystemMetrics start, so don't re-thin them against ChannelData's own first reading)
         if (per_minute and "Samples" not in d.columns and ts_col in d.columns
-                and pd.api.types.is_numeric_dtype(d[ts_col])):
+                and pd.api.types.is_numeric_dtype(d[ts_col])
+                and not _already_per_minute(d[ts_col], d["ChannelID"])):
             secs = d[ts_col].astype(float)
             d = d[np.round(secs - secs.min(), 0) % 60 == 0]  # matches Time_sec in the markup
         for c in CHANNEL_FLOAT32:
@@ -457,6 +471,8 @@ def per_minute_rows(channel_data):
     already per minute."""
     if "Samples" in channel_data.columns:
         return channel_data
+    if len(channel_data) and _already_per_minute(channel_data["Time_abs_sec"], channel_data["ChannelID"]):
+        return channel_data  # thinned export (export_run_metrics.bat)
     return channel_data[channel_data["Time_sec"] % 60 == 0]
 
 
