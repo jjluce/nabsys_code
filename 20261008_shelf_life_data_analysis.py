@@ -313,7 +313,7 @@ CYCLE_METRICS = {"TotalEventRate": "Total Event Rate (system)",
                  "ActiveChannelCount": "Active Channel Count",
                  "SignalRMS": "Signal RMS"}
 SHOW_SD = False               # True adds a faint ±1 SD band across runs to each line
-VIAB_MAX_ALPHA = 0.85         # opacity of a cell that is non-viable in every reading of every replicate
+VIAB_MAX_ALPHA = 0.3          # opacity of a cell that is non-viable in every reading of every replicate
 
 # %%
 # Per-cycle averages
@@ -361,22 +361,26 @@ def cycle_x(inj, c):
     return c if inj == "A" else n_a + INJ_GAP_WIDTH + c
 
 # %%
-# Collection-cycle overlay figure
+# Collection-cycle overlay figure (3 time points x 4 rows) + each panel as its own figure
 from matplotlib.colors import to_rgb
 
-def draw_inj_gap(ax, label=True):
+def draw_inj_gap(ax):
     g0, g1 = n_a + 0.5, n_a + INJ_GAP_WIDTH + 0.5
     ax.axvspan(g0, g1, color="#e6e6e6", lw=0, zorder=0.5)
-    ax.axvline(g1, color="#555555", ls="--", lw=1, zorder=4)
-    if label:
-        ax.text((g0 + g1) / 2, 0.5, "1st > 2nd Inj Gap", transform=ax.get_xaxis_transform(),
-                rotation=90, ha="center", va="center", fontsize=8, color="#666666", zorder=4)
+    for g in (g0, g1):
+        ax.axvline(g, color="#555555", ls="--", lw=1, zorder=4)
+    ax.text((g0 + g1) / 2, 0.5, "1st > 2nd Inj Gap", transform=ax.get_xaxis_transform(),
+            rotation=90, ha="center", va="center", fontsize=8, color="#666666", zorder=4)
 
 
 def viability_image(tp):
-    """RGBA image (channels x cycle positions): white, with each condition's color layered on
-    at alpha = VIAB_MAX_ALPHA x fraction non-viable. Returns None if no data at this time point."""
-    img = np.ones((n_channels, n_x, 3))
+    """RGBA image (channels x cycle positions). Each condition contributes
+    alpha = VIAB_MAX_ALPHA x (fraction of its readings non-viable, averaged over replicates).
+    The alphas add up, so with VIAB_MAX_ALPHA = 0.3 a channel dead in all three conditions
+    reaches 0.9 total; the cell color is the alpha-weighted mix of the condition colors over white.
+    Returns None if there is no data at this time point."""
+    total_a = np.zeros((n_channels, n_x))
+    color_sum = np.zeros((n_channels, n_x, 3))
     found = False
     for g in groups:
         rgb = np.array(to_rgb(GROUP_COLORS[g]))
@@ -390,84 +394,123 @@ def viability_image(tp):
             ch_idx = f.index.get_level_values("ChannelID").to_numpy() - 1
             x_idx = np.array([cycle_x(inj, k) for k in f.index.get_level_values("Cycle")]) - 1
             a[ch_idx, x_idx] = VIAB_MAX_ALPHA * f.to_numpy()
-            img = img * (1 - a[..., None]) + rgb * a[..., None]   # "over" compositing
+            total_a += a
+            color_sum += a[..., None] * rgb
     if not found:
         return None
+    total_a = np.clip(total_a, 0, 1)
+    img = (1 - total_a[..., None]) * 1.0 + color_sum   # white background + weighted condition colors
     alpha = np.ones((n_channels, n_x, 1))
-    alpha[:, n_a:n_a + INJ_GAP_WIDTH] = 0          # let the grey injection-gap band show through
-    return np.concatenate([img, alpha], axis=2)
+    alpha[:, n_a:n_a + INJ_GAP_WIDTH] = 0             # let the grey injection-gap band show through
+    return np.concatenate([np.clip(img, 0, 1), alpha], axis=2)
 
 
-tick_cycles = [c for c in range(1, n_a + n_b + 1) if c == 1 or c % 8 == 0]
-tick_x = [cycle_x("A", c) if c <= n_a else cycle_x("B", c - n_a) for c in tick_cycles]
-n_rows = len(CYCLE_METRICS) + 1
+def no_data(ax):
+    ax.text(0.5, 0.8, "No data yet", transform=ax.transAxes, ha="center", va="center",
+            fontsize=11, color="#999999", zorder=5,
+            bbox=dict(facecolor="white", edgecolor="none", pad=3))
 
-fig, axes = plt.subplots(n_rows, len(ALL_TIME_POINTS),
-                         figsize=(5.5 * len(ALL_TIME_POINTS), 3.6 * n_rows),
-                         sharex=True, sharey="row", squeeze=False)
-for c, tp in enumerate(ALL_TIME_POINTS):
-    # line rows
-    for r, (col, label) in enumerate(CYCLE_METRICS.items()):
-        ax = axes[r, c]
-        draw_inj_gap(ax)
-        has_data = False
-        for g in groups:
-            for inj in ("A", "B"):
-                if (g, tp, inj) not in cond_cycles.index.droplevel("Cycle"):
-                    continue
-                d = cond_cycles.loc[(g, tp, inj), col]
-                x = np.array([cycle_x(inj, k) for k in d.index])
-                ax.plot(x, d["mean"], color=GROUP_COLORS[g], lw=2, marker="o", ms=3.5, zorder=3)
-                if SHOW_SD:
-                    sd = d["std"].fillna(0)
-                    ax.fill_between(x, d["mean"] - sd, d["mean"] + sd, color=GROUP_COLORS[g],
-                                    alpha=0.15, lw=0, zorder=2)
-                has_data = True
-        if not has_data:
-            ax.text(0.5, 0.8, "No data yet", transform=ax.transAxes, ha="center", va="center",
-                    fontsize=11, color="#999999", zorder=5,
-                    bbox=dict(facecolor="white", edgecolor="none", pad=3))
-        if c == 0:
-            ax.set_ylabel(label)
 
-    # viability row
-    ax = axes[-1, c]
+def draw_cycle_lines(ax, col, tp):
+    """One condition-mean line per group (A and B injections). Returns True if anything was drawn."""
+    draw_inj_gap(ax)
+    has_data = False
+    for g in groups:
+        for inj in ("A", "B"):
+            if (g, tp, inj) not in cond_cycles.index.droplevel("Cycle"):
+                continue
+            d = cond_cycles.loc[(g, tp, inj), col]
+            x = np.array([cycle_x(inj, k) for k in d.index])
+            ax.plot(x, d["mean"], color=GROUP_COLORS[g], lw=2, marker="o", ms=3.5, zorder=3)
+            if SHOW_SD:
+                sd = d["std"].fillna(0)
+                ax.fill_between(x, d["mean"] - sd, d["mean"] + sd, color=GROUP_COLORS[g],
+                                alpha=0.15, lw=0, zorder=2)
+            has_data = True
+    if not has_data:
+        no_data(ax)
+    return has_data
+
+
+def draw_viability(ax, tp):
     img = viability_image(tp)
     if img is not None:
         ax.imshow(img, aspect="auto", origin="lower", interpolation="nearest", zorder=1,
                   extent=(0.5, n_x + 0.5, 0.5, n_channels + 0.5))
     else:
-        ax.text(0.5, 0.8, "No data yet", transform=ax.transAxes, ha="center", va="center",
-                fontsize=11, color="#999999", zorder=5,
-                bbox=dict(facecolor="white", edgecolor="none", pad=3))
-    draw_inj_gap(ax, label=img is None)
+        no_data(ax)
+    draw_inj_gap(ax)
     ax.set_ylim(0.5, n_channels + 0.5)
     ax.grid(False)
-    if c == 0:
-        ax.set_ylabel("Channel (shaded = non-viable)")
+    return img is not None
 
-    for r in range(n_rows):
+
+def format_cycle_axis(ax):
+    for inj, x0 in (("Inj A", 1), ("Inj B", n_a + INJ_GAP_WIDTH + 1)):
+        ax.text(x0, 1.01, inj, transform=ax.get_xaxis_transform(), fontsize=8, color="#555555")
+    ax.set_xticks(tick_x, [str(t) for t in tick_cycles])
+    ax.set_xlim(0.5, n_x + 0.5)
+    ax.tick_params(labelleft=True)
+
+
+tick_cycles = [c for c in range(1, n_a + n_b + 1) if c == 1 or c % 8 == 0]
+tick_x = [cycle_x("A", c) if c <= n_a else cycle_x("B", c - n_a) for c in tick_cycles]
+VIAB_LABEL = "Channel (shaded = non-viable)"
+VIAB_NOTE = ("Viability: darker = channel non-viable in more of that condition's readings "
+             f"(fraction per cycle, averaged over replicates; max {VIAB_MAX_ALPHA:g} per condition)")
+cycle_handles = [Line2D([], [], color=GROUP_COLORS[g], lw=2, marker="o", ms=4,
+                        label=f"{g}: {group_label[g]}") for g in groups]
+panels = [(col, label) for col, label in CYCLE_METRICS.items()] + [("Viability", VIAB_LABEL)]
+
+# %%
+# Overlay grid (all 12 panels)
+
+n_rows = len(panels)
+fig, axes = plt.subplots(n_rows, len(ALL_TIME_POINTS),
+                         figsize=(5.5 * len(ALL_TIME_POINTS), 3.6 * n_rows),
+                         sharex=True, sharey="row", squeeze=False)
+for c, tp in enumerate(ALL_TIME_POINTS):
+    for r, (col, label) in enumerate(panels):
         ax = axes[r, c]
-        for inj, x0 in (("Inj A", 1), ("Inj B", n_a + INJ_GAP_WIDTH + 1)):
-            ax.text(x0, 1.01, inj, transform=ax.get_xaxis_transform(), fontsize=8, color="#555555")
-        ax.set_xticks(tick_x, [str(t) for t in tick_cycles])
-        ax.set_xlim(0.5, n_x + 0.5)
-        ax.tick_params(labelleft=True)
+        draw_viability(ax, tp) if col == "Viability" else draw_cycle_lines(ax, col, tp)
+        format_cycle_axis(ax)
+        if c == 0:
+            ax.set_ylabel(label)
     axes[0, c].set_title(f"{tp} months", loc="left", fontweight="bold", pad=14)
     axes[-1, c].set_xlabel("Collection cycle")
 
-handles = [Line2D([], [], color=GROUP_COLORS[g], lw=2, marker="o", ms=4,
-                  label=f"{g}: {group_label[g]}") for g in groups]
-fig.legend(handles=handles, loc="lower center", ncol=len(handles), frameon=False, fontsize=9,
-           bbox_to_anchor=(0.5, 0.0))
-fig.text(0.5, -0.012, "Viability row: darker = channel non-viable in more of that condition's readings "
-         "(fraction of readings per cycle, averaged over replicates)", ha="center", fontsize=8.5,
-         color="#555555")
+fig.legend(handles=cycle_handles, loc="lower center", ncol=len(cycle_handles), frameon=False,
+           fontsize=9, bbox_to_anchor=(0.5, 0.0))
+fig.text(0.5, -0.012, VIAB_NOTE, ha="center", fontsize=8.5, color="#555555")
 fig.suptitle("Detector shelf life — systemwide metrics per collection cycle (mean of runs per condition)",
              x=0.01, ha="left", fontsize=13, fontweight="bold")
 fig.tight_layout(rect=(0, 0.035, 1, 0.98))
 fig.savefig(OUT_DIR / "shelf_life_cycle_overlay.png", dpi=200, bbox_inches="tight")
 plt.show()
+
+# %%
+# Individual panels (one figure per metric per time point; time points without data are skipped)
+
+for tp in ALL_TIME_POINTS:
+    for col, label in panels:
+        fig, ax = plt.subplots(figsize=(9, 4.5))
+        drawn = draw_viability(ax, tp) if col == "Viability" else draw_cycle_lines(ax, col, tp)
+        if not drawn:
+            plt.close(fig)
+            continue
+        format_cycle_axis(ax)
+        ax.set_ylabel(label)
+        ax.set_xlabel("Collection cycle")
+        name = "Channel Viability" if col == "Viability" else CYCLE_METRICS[col]
+        ax.set_title(f"{name} — {tp} months", loc="left", fontweight="bold", pad=14)
+        ax.legend(handles=cycle_handles, frameon=False, fontsize=8,
+                  loc="upper left", bbox_to_anchor=(1.01, 1))
+        if col == "Viability":
+            fig.text(0.01, -0.02, VIAB_NOTE, fontsize=7.5, color="#555555")
+        fig.tight_layout()
+        safe = re.sub(r"[^A-Za-z0-9]+", "_", name).strip("_")
+        fig.savefig(OUT_DIR / f"shelf_life_cycle_{safe}_{tp}mo.png", dpi=200, bbox_inches="tight")
+        plt.show()
 # endregion
 
 # %%
